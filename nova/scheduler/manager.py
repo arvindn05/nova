@@ -159,6 +159,21 @@ class SchedulerManager(manager.Manager):
                 for ar in alloc_reqs:
                     for rp_uuid in ar['allocations']:
                         alloc_reqs_by_rp_uuid[rp_uuid].append(ar)
+        elif is_rebuild and 'image' in spec_obj \
+                and 'properties' in spec_obj.image \
+                and 'traits_required' in spec_obj.image.properties:
+            # Rebuild case with image having traits
+            node = objects.compute_node.ComputeNode.get_by_host_and_nodename(
+                ctxt, spec_obj.force_hosts[0], spec_obj.force_nodes[0])
+            # host_api = nova.compute.api.API.HostAPI()
+            # host = host_api.service_get_by_compute_host(
+            # ctxt,spec_obj.force_hosts[0])
+            res = self.placement_client.get_resource_provider(ctxt, node.uuid)
+            traits_required = spec_obj.image.properties.traits_required
+            if not set(traits_required).issubset(set(res.traits)):
+                LOG.debug("required traits specified in the image do not "
+                          "match the traits on the compute host.")
+            raise exception.NoValidHost(reason="")
 
         # Only return alternates if both return_objects and return_alternates
         # are True.

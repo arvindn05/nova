@@ -444,7 +444,7 @@ class SchedulerReportClient(object):
         raise exception.ResourceProviderTraitRetrievalFailed(uuid=rp_uuid)
 
     @safe_connect
-    def _get_resource_provider(self, context, uuid):
+    def get_resource_provider(self, context, uuid):
         """Queries the placement API for a resource provider record with the
         supplied UUID.
 
