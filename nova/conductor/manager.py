@@ -941,6 +941,19 @@ class ComputeTaskManager(base.Base):
                     # if we want to make sure that the next destination
                     # is not forced to be the original host
                     request_spec.reset_forced_destinations()
+                else:
+                    # The user is requesting a rebuild with a new image on the
+                    # same host, we need to validate the traits vs allocations.
+                    try:
+                        self._validate_image_traits_for_rebuild(context,
+                                                                instance,
+                                                                image_ref)
+                    except exception.NoValidHost as ex:
+                        self._handle_rebuild_exception(context, ex, instance,
+                                                       image_ref,
+                                                       orig_image_ref,
+                                                       migration,
+                                                       request_spec)
                 try:
                     request_spec.ensure_project_and_user_id(instance)
                     host_lists = self._schedule_instances(context,
@@ -949,24 +962,14 @@ class ComputeTaskManager(base.Base):
                     host_list = host_lists[0]
                     selection = host_list[0]
                     host, node, limits = (selection.service_host,
-                            selection.nodename, selection.limits)
+                                          selection.nodename, selection.limits)
                 except (exception.NoValidHost,
                         exception.UnsupportedPolicyException) as ex:
-                    if migration:
-                        migration.status = 'error'
-                        migration.save()
-                    # Rollback the image_ref if a new one was provided (this
-                    # only happens in the rebuild case, not evacuate).
-                    if orig_image_ref and orig_image_ref != image_ref:
-                        instance.image_ref = orig_image_ref
-                        instance.save()
-                    with excutils.save_and_reraise_exception():
-                        self._set_vm_state_and_notify(context, instance.uuid,
-                                'rebuild_server',
-                                {'vm_state': vm_states.ERROR,
-                                 'task_state': None}, ex, request_spec)
-                        LOG.warning('Rebuild failed: %s',
-                                    six.text_type(ex), instance=instance)
+                    self._handle_rebuild_exception(context, ex, instance,
+                                                   image_ref,
+                                                   orig_image_ref,
+                                                   migration,
+                                                   request_spec)
 
             compute_utils.notify_about_instance_usage(
                 self.notifier, context, instance, "rebuild.scheduled")
@@ -989,6 +992,73 @@ class ComputeTaskManager(base.Base):
                     migration=migration,
                     host=host, node=node, limits=limits,
                     request_spec=request_spec)
+
+    def _handle_rebuild_exception(self, context, ex, instance, image_ref,
+                                  orig_image_ref, migration, request_spec):
+        if migration:
+            migration.status = 'error'
+            migration.save()
+        # Rollback the image_ref if a new one was provided (this
+        # only happens in the rebuild case, not evacuate).
+        if orig_image_ref and orig_image_ref != image_ref:
+            instance.image_ref = orig_image_ref
+            instance.save()
+        with excutils.save_and_reraise_exception():
+            self._set_vm_state_and_notify(context, instance.uuid,
+                                          'rebuild_server',
+                                          {'vm_state': vm_states.ERROR,
+                                           'task_state': None}, ex,
+                                          request_spec)
+            LOG.warning('Rebuild failed: %s',
+                        six.text_type(ex), instance=instance)
+
+    def _validate_image_traits_for_rebuild(self, context, instance, image_ref):
+        """Validates that the traits specified in the image can be satisfied
+        by the current allocations for the instance during rebuild/evacuation
+        of the instance. If the traits cannot be satisfied, fails the action
+        by raising a NoValidHost exception.
+
+        :raises: NoValidHost exception in case the allocated resources for the
+                 instance do not match the required traits on the image.
+        """
+        image_traits = set()
+        image_meta = objects.ImageMeta.from_image_ref(
+            context, self.image_api, image_ref)
+        if ('properties' in image_meta and
+                'traits_required' in image_meta.properties):
+            image_traits.update(
+                image_meta.properties.traits_required)
+
+        # If image traits are present, then validate against allocations.
+        if len(image_traits) > 0:
+            allocations = self.report_client.get_allocations_for_consumer(
+                context, instance.uuid)
+            instance_rp_uuids = list(allocations)
+
+            # Get provider tree for the instance. Any RP id of the instance
+            # can be provided and the full tree is returned.
+            instance_rp_tree = \
+                self.report_client.get_provider_tree_and_ensure_root(
+                    context, instance_rp_uuids[0])
+
+            traits_in_instance_rp = set()
+
+            for rp_uuid in instance_rp_uuids:
+                traits_in_instance_rp.update(
+                    instance_rp_tree.data(rp_uuid).traits)
+
+            missing_traits = image_traits - traits_in_instance_rp
+
+            if len(missing_traits) > 0:
+                LOG.warning(
+                    "The following traits were in the image but not "
+                    "in the instance's allocated Resource Providers: %s",
+                    ', '.join(missing_traits))
+                ex = exception.NoValidHost(
+                    reason="Image traits cannot be "
+                           "satisfied by the current resource providers."
+                           "Please relaunch the instance.")
+                raise ex
 
     # TODO(avolkov): move method to bdm
     @staticmethod

@@ -27,6 +27,7 @@ import six
 
 from nova import block_device
 from nova.compute import flavors
+from nova.compute import provider_tree
 from nova.compute import rpcapi as compute_rpcapi
 from nova.compute import task_states
 from nova.compute import vm_states
@@ -1474,6 +1475,184 @@ class _BaseTaskTestCase(object):
                                             **compute_args)
         self.assertEqual('compute.instance.rebuild.scheduled',
                          fake_notifier.NOTIFICATIONS[0].event_type)
+
+    def test_rebuild_instance_with_image_traits(self):
+        inst_obj = self._create_fake_instance_obj()
+        inst_obj.host = 'thebesthost'
+        expected_host = inst_obj.host
+        expected_node = 'thebestnode'
+        host_rp_uuid = '356dee41-a91a-4f29-8bf5-ac41faf31c81'
+
+        fake_selection = objects.Selection(service_host=expected_host,
+                                           nodename=expected_node, limits=None)
+        fake_spec = objects.RequestSpec()
+        rebuild_args, compute_args = self._prepare_rebuild_args(
+            {'host': None, 'node': None, 'request_spec': fake_spec})
+
+        fake_image_meta = objects.ImageMeta.from_dict(
+            {
+                'status': 'active',
+                'container_format': 'bare',
+                'properties': {
+                    'trait:CUSTOM_TRUSTED': 'required',
+                }
+            }
+        )
+        fake_instance_alloc = {
+            host_rp_uuid: {
+                "generation": 11,
+                "resources": {
+                    "VCPU": 1,
+                    "MEMORY_MB": 512,
+                    "DISK_GB": 1
+                }
+
+            }
+        }
+        fake_rp_tree = provider_tree.ProviderTree()
+        fake_rp_tree.new_root(inst_obj.host, host_rp_uuid)
+        fake_rp_tree.update_traits(host_rp_uuid, ['CUSTOM_TRUSTED'])
+
+        with test.nested(
+            mock.patch.object(self.conductor_manager.compute_rpcapi,
+                              'rebuild_instance'),
+            mock.patch.object(objects.ImageMeta,
+                              'from_image_ref',
+                              return_value=fake_image_meta),
+            mock.patch.object(self.conductor_manager.report_client,
+                              'get_allocations_for_consumer',
+                              return_value=fake_instance_alloc),
+            mock.patch.object(self.conductor_manager.report_client,
+                              'get_provider_tree_and_ensure_root',
+                              return_value=fake_rp_tree),
+            mock.patch.object(self.conductor_manager.scheduler_client,
+                              'select_destinations',
+                              return_value=[[fake_selection]]),
+            mock.patch.object(scheduler_utils, 'setup_instance_group',
+                              return_value=False)
+        ) as (rebuild_mock, image_mock, rc_alloc_mock,
+              rc_provider_tree_mock, select_dest_mock, sig_mock):
+            self.conductor_manager.rebuild_instance(context=self.context,
+                                                    instance=inst_obj,
+                                                    **rebuild_args)
+            self.assertTrue(select_dest_mock.called)
+            rc_alloc_mock.assert_called_once_with(self.context, inst_obj.uuid)
+            rc_provider_tree_mock.assert_called_once_with(self.context,
+                                                          host_rp_uuid)
+
+            compute_args['host'] = expected_host
+            compute_args['node'] = expected_node
+            compute_args['request_spec'] = fake_spec
+
+            rebuild_mock.assert_called_once_with(self.context,
+                                                 instance=inst_obj,
+                                                 **compute_args)
+        self.assertEqual('compute.instance.rebuild.scheduled',
+                         fake_notifier.NOTIFICATIONS[0].event_type)
+
+    def test_rebuild_instance_with_image_traits_no_image_change(self):
+        """If Image has not changed we should not call the scheduler filters
+        or validate traits vs allocations
+        """
+        inst_obj = self._create_fake_instance_obj()
+        inst_obj.host = 'thebesthost'
+        expected_host = inst_obj.host
+        expected_node = 'thebestnode'
+
+        fake_spec = objects.RequestSpec()
+        # the host is passed to rebuild only if image has not changed
+        rebuild_args, compute_args = self._prepare_rebuild_args(
+            {'host': expected_host, 'node': expected_node,
+             'request_spec': fake_spec})
+
+        with test.nested(
+            mock.patch.object(self.conductor_manager.compute_rpcapi,
+                              'rebuild_instance'),
+            mock.patch.object(self.conductor_manager.scheduler_client,
+                              'select_destinations'),
+            mock.patch.object(scheduler_utils, 'setup_instance_group',
+                              return_value=False)
+        ) as (rebuild_mock, select_dest_mock, sig_mock):
+            self.conductor_manager.rebuild_instance(context=self.context,
+                                                    instance=inst_obj,
+                                                    **rebuild_args)
+            self.assertFalse(select_dest_mock.called)
+
+            compute_args['host'] = expected_host
+            # TODO:karim check why node should be None
+            compute_args['node'] = None
+            compute_args['request_spec'] = fake_spec
+
+            rebuild_mock.assert_called_once_with(self.context,
+                                                 instance=inst_obj,
+                                                 **compute_args)
+        self.assertEqual('compute.instance.rebuild.scheduled',
+                         fake_notifier.NOTIFICATIONS[0].event_type)
+
+    def test_rebuild_instance_with_image_traits_no_host(self):
+        inst_obj = self._create_fake_instance_obj()
+        inst_obj.host = 'thebesthost'
+        host_rp_uuid = '356dee41-a91a-4f29-8bf5-ac41faf31c81'
+
+        fake_spec = objects.RequestSpec()
+        rebuild_args, compute_args = self._prepare_rebuild_args(
+            {'host': None, 'node': None, 'request_spec': fake_spec})
+
+        fake_image_meta = objects.ImageMeta.from_dict(
+            {
+                'status': 'active',
+                'container_format':
+                    'bare',
+                'properties': {
+                    'trait:CUSTOM_TRUSTED': 'required',
+                }
+            }
+        )
+        fake_instance_alloc = {
+            host_rp_uuid: {
+                "generation": 11,
+                "resources": {
+                    "VCPU": 1,
+                    "MEMORY_MB": 512,
+                    "DISK_GB": 1
+                }
+
+            }
+        }
+        fake_rp_tree = provider_tree.ProviderTree()
+        fake_rp_tree.new_root(inst_obj.host, host_rp_uuid)
+        fake_rp_tree.update_traits(host_rp_uuid, ['CUSTOM_FOO'])
+
+        with test.nested(
+            mock.patch.object(self.conductor_manager.compute_rpcapi,
+                              'rebuild_instance'),
+            mock.patch.object(objects.ImageMeta,
+                              'from_image_ref',
+                              return_value=fake_image_meta),
+            mock.patch.object(self.conductor_manager.report_client,
+                              'get_allocations_for_consumer',
+                              return_value=fake_instance_alloc),
+            mock.patch.object(self.conductor_manager.report_client,
+                              'get_provider_tree_and_ensure_root',
+                              return_value=fake_rp_tree),
+            mock.patch.object(scheduler_utils, 'set_vm_state_and_notify')
+        ) as (rebuild_mock, image_mock, rc_alloc_mock,
+              rc_provider_tree_mock, set_vm_state_and_notify_mock):
+
+            self.assertRaises(exc.NoValidHost,
+                              self.conductor_manager.rebuild_instance,
+                              context=self.context, instance=inst_obj,
+                              **rebuild_args)
+
+            rc_alloc_mock.assert_called_once_with(self.context, inst_obj.uuid)
+            rc_provider_tree_mock.assert_called_once_with(self.context,
+                                                          host_rp_uuid)
+
+            self.assertEqual(
+                set_vm_state_and_notify_mock.call_args[0][4]['vm_state'],
+                vm_states.ERROR)
+
+            self.assertFalse(rebuild_mock.called)
 
 
 class ConductorTaskTestCase(_BaseTaskTestCase, test_compute.BaseTestCase):
